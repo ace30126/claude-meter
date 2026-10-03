@@ -4,6 +4,8 @@ Claude Code 토큰 사용량을 화면 구석에 띄워 두는 작은 플로팅 
 
 A tiny always-on-top widget that shows your Claude Code token usage. Portable single exe, no install, no API key.
 
+![Claude Meter](docs/screenshot.png)
+
 ```
 ● 컨텍스트 135k · 활성 3
 ━━━━━━━━━━━━━━━━━━━━━━━━
