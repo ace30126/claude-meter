@@ -399,8 +399,21 @@ class Widget:
                 w.tip_anchor = row[0]
         self.last = None
         self.bar.bind("<Configure>", lambda e: self.last and self._render(self.last))
+        self.root.protocol("WM_DELETE_WINDOW", self._quit)  # 작업표시줄 버튼의 "창 닫기"
+        if sys.platform == "win32":
+            self.root.after(10, self._taskbar)
         self._layout()
         self._tick()
+
+    def _taskbar(self):
+        # 테두리 없는 창은 작업표시줄 버튼이 없어 잃어버리기 쉽다. 확장 스타일을 앱 창으로 바꿔 버튼을 만든다.
+        import ctypes
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetParent(self.root.winfo_id())
+        style = user32.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
+        user32.SetWindowLongW(hwnd, -20, (style & ~0x80) | 0x40000)  # -WS_EX_TOOLWINDOW, +WS_EX_APPWINDOW
+        self.root.withdraw()  # 스타일은 창을 다시 띄울 때 반영된다
+        self.root.after(10, self.root.deiconify)
 
     def _bind(self, w):
         w.bind("<ButtonPress-1>", self._press)

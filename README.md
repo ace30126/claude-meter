@@ -61,6 +61,7 @@ A tiny always-on-top widget that shows your Claude Code token usage. Portable si
 
 1. [Releases](../../releases)에서 `ClaudeMeter.exe`를 받아 아무 폴더에 두고 실행합니다.
 2. 왼쪽 드래그로 이동, 더블클릭으로 접기/펴기, 오른쪽 클릭으로 메뉴(항상 위·투명도·언어·종료)를 엽니다.
+   작업표시줄 버튼으로 숨기기/불러오기, 버튼 오른쪽 클릭 → "창 닫기"로 종료할 수 있습니다.
 3. 설정은 exe 옆 `claude_meter.json`에 저장됩니다.
 
 소스에서 실행: `python claude_meter.py` (Python 3.10+, 표준 라이브러리만 사용)
