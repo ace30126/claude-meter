@@ -27,6 +27,19 @@ A tiny always-on-top widget that shows your Claude Code token usage. Portable si
 | 5h / 주간 | 플랜 한도 사용률 막대와 리셋 시각 (`/usage`와 같은 값). 80% 이상 빨강 (설정 가능) |
 | 세션#N | 활성 세션이 2개 이상일 때 최근 응답 순으로 2개, 나머지는 `기타 N개`. 마우스를 올리면 작업 폴더와 시작 시각 |
 
+### 마우스를 올리면 (v0.2.0)
+
+![툴팁](docs/tooltips.png)
+
+| 줄 | 툴팁 |
+|---|---|
+| 컨텍스트 | 이 세션의 누적 비용(서브에이전트 포함) · 응답 수 · 툴 호출 수(`tool_budget` 기준) · 마지막 응답 n분 전 · 모델 |
+| 오늘 | 모델별 비용 · 서브에이전트 비중 |
+| 5h | 리셋까지 남은 시간 · 마지막 조회 n분 전 · **소진 예측 시각** (리셋 전에 안 닿으면 리셋 때 예상 %) |
+| 주간 | 리셋까지 남은 기간 · **페이스** (지금까지 지난 기간 대비 여유/초과 %p) · 이 속도면 리셋 때 예상 % |
+
+소진 예측은 최근 1시간 조회값의 기울기로 계산합니다. 조회값이 아직 부족하면 5시간 창 시작부터의 평균 속도를 씁니다. 조회값은 캐시 파일에 5시간치만 쌓으므로 예측 때문에 API를 더 부르지는 않습니다.
+
 비용은 공개 API 단가로 계산한 **참고값**입니다. Pro/Max 구독이라면 실제 청구액이 아닙니다.
 
 ## 어디서 데이터를 읽나
@@ -63,6 +76,7 @@ A tiny always-on-top widget that shows your Claude Code token usage. Portable si
 | `lang` | `ko` | `ko` / `en` |
 | `plan_usage` / `plan_refresh_sec` | `true` / 120 | 한도 사용률 조회 여부·주기 |
 | `limit_red` | 80 | 한도 막대가 빨강이 되는 사용률(%) |
+| `tool_budget` | 150 | 컨텍스트 툴팁에 함께 보여줄 세션당 툴 호출 기준 |
 | `claude_dir` | `null` | 로그 폴더를 바꿀 때 (`CLAUDE_CONFIG_DIR` 사용자) |
 | `prices` | `{}` | 단가 덮어쓰기: `{"claude-opus-5-5": [4, 20, 0.2]}` = input/output/cache read, USD per 1M |
 
@@ -71,6 +85,7 @@ A tiny always-on-top widget that shows your Claude Code token usage. Portable si
 - 전체화면 독점 모드(일부 게임·영상) 위에는 Windows가 그리지 않습니다.
 - 한도 조회가 실패했을 때 나오는 `5h 블록`은 로그로 추정한 값이라 공식 한도와 다를 수 있습니다.
 - 단가는 2026-09 기준입니다. 새 모델이 나오면 `prices`로 추가하세요.
+- 소진 예측·페이스는 지금 속도가 이어진다고 보는 직선 외삽입니다. 작업이 몰리거나 쉬면 크게 바뀝니다.
 
 ## License
 

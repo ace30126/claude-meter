@@ -8,6 +8,7 @@
   2. 오늘 누적 토큰 · API 단가 환산 비용
   3. 플랜 한도 사용률(5시간·주간). 실패하면 로그로 추정한 5시간 블록 토큰 · 남은 시간
   4. 활성 세션이 2개 이상이면 세션#1, 세션#2, 기타 N개 (마우스를 올리면 작업 폴더 이름)
+  줄마다 마우스를 올리면 툴팁: 세션 비용·응답·툴 호출 / 모델별 $·서브에이전트 비중 / 5h 소진 예측 / 주간 페이스
 
 한도 사용률은 Claude Code 로그인 토큰(~/.claude/.credentials.json)으로 /usage 와 같은 비공개 엔드포인트를
 120초마다 읽는다(429 시 백오프, 응답은 claude_meter_usage.json 에 캐시). 토큰을 갱신하지는 않는다(Claude Code 로그인이 꼬일 수 있음). 만료되면 Claude Code 가 갱신할 때까지 추정값을 쓴다.
@@ -17,6 +18,7 @@
 import glob
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -46,16 +48,31 @@ DEFAULTS = {
     "x": None, "y": None, "alpha": 0.88, "compact": False, "topmost": True,
     "refresh_sec": 5, "warn_ctx": 200_000, "stop_ctx": 300_000,
     "lang": "ko", "claude_dir": None, "prices": {}, "plan_usage": True, "plan_refresh_sec": 120, "limit_red": 80,
+    "tool_budget": 150,
 }
 TEXT = {
     "ko": {"ctx": "컨텍스트", "today": "오늘", "block": "5h 블록", "left": "남음", "idle": "블록 없음",
            "limit": "한도", "reset": "리셋", "week": "주간", "session": "세션", "others": "기타", "count": "개",
            "sessions": "활성", "refresh": "새로고침", "top": "항상 위", "opacity": "투명도",
-           "lang": "English", "quit": "종료", "none": "세션 없음"},
+           "lang": "English", "quit": "종료", "none": "세션 없음",
+           "t_cost": "비용  ${:.2f}  (서브에이전트 포함)", "t_resp": "응답 {} · 툴 호출 {} / {}",
+           "t_last": "마지막 응답  {} · {}", "t_sub": "서브에이전트  {:.0f}%  (${:.2f})",
+           "t_reset": "리셋까지  {}  ({})", "t_fetched": "마지막 조회  {}",
+           "t_eta": "소진 예측  {}", "t_safe": "리셋 전 소진 없음 (리셋 때 약 {:.0f}%)", "t_flat": "증가 없음",
+           "t_pace": "페이스  {} {:.0f}%p  (지금 기대치 {:.0f}%)", "t_ahead": "여유", "t_over": "초과",
+           "t_proj": "이 속도면 리셋 때 약 {:.0f}%", "now": "방금", "ago": "{} 전",
+           "d": "{}일 {}시간", "h": "{}시간 {}분", "m": "{}분"},
     "en": {"ctx": "Context", "today": "Today", "block": "5h block", "left": "left", "idle": "no block",
            "limit": "Limit", "reset": "reset", "week": "week", "session": "Session", "others": "Others", "count": "",
            "sessions": "active", "refresh": "Refresh", "top": "Always on top", "opacity": "Opacity",
-           "lang": "한국어", "quit": "Quit", "none": "no session"},
+           "lang": "한국어", "quit": "Quit", "none": "no session",
+           "t_cost": "Cost  ${:.2f}  (incl. subagents)", "t_resp": "Replies {} · tool calls {} / {}",
+           "t_last": "Last reply  {} · {}", "t_sub": "Subagents  {:.0f}%  (${:.2f})",
+           "t_reset": "Resets in  {}  ({})", "t_fetched": "Last fetched  {}",
+           "t_eta": "Hits 100%  {}", "t_safe": "not before reset (≈{:.0f}% at reset)", "t_flat": "no growth",
+           "t_pace": "Pace  {} {:.0f}%p  (expected now {:.0f}%)", "t_ahead": "under by", "t_over": "over by",
+           "t_proj": "At this pace ≈{:.0f}% at reset", "now": "just now", "ago": "{} ago",
+           "d": "{}d {}h", "h": "{}h {}m", "m": "{}m"},
 }
 COLORS = {"bg": "#1b1d23", "fg": "#e6e6e6", "dim": "#8a8f98",
           "ok": "#4cc38a", "warn": "#f5b83d", "stop": "#ef5b5b"}
@@ -103,7 +120,10 @@ class Ledger:
         self.ctx = {}       # main session path -> (ts, context tokens)
         self.cwd = {}       # main session path -> 작업 폴더
         self.start = {}     # main session path -> 첫 응답 시각
-        self.events = {}    # message id -> (datetime, model, usage)
+        self.events = {}    # message id -> (datetime, model, usage, is_sub)
+        self.msgs = {}      # main session path -> {message id: (model, usage, is_sub)}  서브에이전트 포함
+        self.tools = {}     # main session path -> 툴 호출(tool_use id) 집합
+        self.last = {}      # main session path -> (마지막 응답 시각, 모델)
 
     def scan(self):
         cutoff = time.time() - KEEP.total_seconds()
@@ -143,8 +163,17 @@ class Ledger:
                 ts = datetime.fromisoformat(d["timestamp"].replace("Z", "+00:00"))
             except (KeyError, ValueError):
                 continue
-            self.events[mid] = (ts, model, u)
-            if not is_sub and not d.get("isSidechain"):
+            side = is_sub or bool(d.get("isSidechain"))
+            self.events[mid] = (ts, model, u, side)
+            # 서브에이전트 로그(<sid>/subagents/*.jsonl)는 부모 세션 <sid>.jsonl 비용에 합산한다
+            main = os.path.dirname(os.path.dirname(path)) + ".jsonl" if is_sub else path
+            self.msgs.setdefault(main, {})[mid] = (model, u, side)
+            if not side:
+                self.last[path] = (ts, model)
+                tools = self.tools.setdefault(path, set())
+                for c in msg.get("content") or []:
+                    if isinstance(c, dict) and c.get("type") == "tool_use":
+                        tools.add(c.get("id"))
                 if not self.cwd.get(path):  # 작업 중 cd 해도 세션 이름은 시작 폴더로 고정
                     self.cwd[path] = d.get("cwd")
                     self.start[path] = ts
@@ -157,12 +186,18 @@ class Ledger:
         midnight = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
         evs = sorted(self.events.values(), key=lambda e: e[0])
 
-        today_tok = sum(total_tokens(u) for ts, _, u in evs if ts >= midnight)
-        today_cost = sum(cost_of(m, u, overrides) for ts, m, u in evs if ts >= midnight)
+        today_tok = sum(total_tokens(u) for ts, _, u, _ in evs if ts >= midnight)
+        models, sub_cost = {}, 0.0
+        for ts, m, u, side in evs:
+            if ts >= midnight:
+                c = cost_of(m, u, overrides)
+                models[short_model(m)] = models.get(short_model(m), 0.0) + c
+                sub_cost += c if side else 0.0
+        today_cost = sum(models.values())
 
         # 5시간 블록: 첫 메시지 시각을 정시로 내림한 지점부터 5시간. 그 뒤 첫 메시지가 새 블록을 연다.
         block_start, block_tok = None, 0
-        for ts, _, u in evs:
+        for ts, _, u, _ in evs:
             if block_start is None or ts >= block_start + BLOCK:
                 block_start, block_tok = ts.replace(minute=0, second=0, microsecond=0), 0
             block_tok += total_tokens(u)
@@ -173,10 +208,24 @@ class Ledger:
 
         live = sorted(((ts, c, f"{session_name(self.cwd.get(p))}  ({self.start[p].astimezone():%H:%M}~)") for p, (ts, c) in self.ctx.items()
                        if now - ts < timedelta(minutes=10)), reverse=True)
-        latest = max(self.ctx.values(), default=None)
-        return {"ctx": latest[1] if latest else None, "active": len(live), "sessions": live,
-                "today_tok": today_tok, "today_cost": today_cost,
+        latest = max(self.ctx, key=lambda p: self.ctx[p][0], default=None)
+        return {"ctx": self.ctx[latest][1] if latest else None, "active": len(live), "sessions": live,
+                "cur": self._session(latest, overrides) if latest else None,
+                "today_tok": today_tok, "today_cost": today_cost, "models": models, "sub_cost": sub_cost,
                 "block_tok": block_tok, "block_left": block_left}
+
+    def _session(self, path, overrides):
+        msgs = self.msgs.get(path, {}).values()
+        last_ts, model = self.last.get(path, (None, ""))
+        return {"name": f"{session_name(self.cwd.get(path))}  ({self.start[path].astimezone():%H:%M}~)",
+                "cost": sum(cost_of(m, u, overrides) for m, u, _ in msgs),
+                "replies": sum(1 for *_, side in msgs if not side),
+                "tools": len(self.tools.get(path, ())), "last": last_ts, "model": short_model(model)}
+
+
+def short_model(model):
+    # claude-haiku-4-5-20251001 -> haiku-4-5
+    return re.sub(r"-\d{8}$", "", model.removeprefix("claude-"))
 
 
 def session_name(cwd):
@@ -209,11 +258,12 @@ class PlanUsage:
         self.interval, self.cache_path = interval, cache_path
         base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
         self.cred = os.path.join(base, ".credentials.json")
-        self.raw, self.at = None, 0.0
+        self.raw, self.at, self.samples = None, 0.0, []  # samples: [조회 시각, 5h %, 주간 %] 소진 예측용
         try:
             with open(cache_path, encoding="utf-8") as f:
                 c = json.load(f)
             self.raw, self.at = c["raw"], c["at"]
+            self.samples = c.get("samples") or []
         except (OSError, ValueError, KeyError):
             pass
         threading.Thread(target=self._loop, daemon=True).start()
@@ -225,8 +275,30 @@ class PlanUsage:
         five, week = self.raw.get("five_hour") or {}, self.raw.get("seven_day") or {}
         if five.get("utilization") is None:
             return None
-        return {"five": five["utilization"], "week": week.get("utilization"),
+        return {"five": five["utilization"], "week": week.get("utilization"), "at": self.at,
                 "reset": to_local(five.get("resets_at")), "week_reset": to_local(week.get("resets_at"))}
+
+    def forecast(self, d):
+        """5h 사용률이 100% 에 닿는 시각. 최근 1시간 샘플의 기울기, 샘플이 모자라면 창 시작부터의 평균.
+
+        반환: (소진 시각 또는 None, 리셋 시점 예상 %). 증가가 없으면 (None, None).
+        """
+        if not d["reset"]:
+            return None, None
+        start = (d["reset"] - BLOCK).timestamp()
+        pts = [(at, p) for at, p, _ in self.samples if at >= max(start, d["at"] - 3600)]
+        if len(pts) >= 2 and pts[-1][0] - pts[0][0] >= 600:
+            rate = (pts[-1][1] - pts[0][1]) / (pts[-1][0] - pts[0][0])
+        elif d["at"] > start:
+            rate = d["five"] / (d["at"] - start)  # 창이 0% 에서 시작했다고 본다
+        else:
+            return None, None
+        if rate <= 0:
+            return None, None
+        at_reset = d["five"] + rate * (d["reset"].timestamp() - d["at"])
+        if at_reset < 100:
+            return None, at_reset
+        return datetime.fromtimestamp(d["at"] + (100 - d["five"]) / rate).astimezone(), at_reset
 
     def _loop(self):
         wait = self.interval
@@ -255,9 +327,12 @@ class PlanUsage:
         except Exception:
             return None
         self.raw, self.at = {k: raw.get(k) for k in ("five_hour", "seven_day")}, time.time()
+        five, week = self.raw.get("five_hour") or {}, self.raw.get("seven_day") or {}
+        self.samples = [x for x in self.samples if x[0] > self.at - BLOCK.total_seconds()]
+        self.samples.append([self.at, five.get("utilization") or 0, week.get("utilization") or 0])
         try:
             with open(self.cache_path, "w", encoding="utf-8") as f:
-                json.dump({"at": self.at, "raw": self.raw}, f)
+                json.dump({"at": self.at, "raw": self.raw, "samples": self.samples}, f)
         except OSError:
             pass
         return 200
@@ -317,6 +392,11 @@ class Widget:
         for w in (self.l_ctx, self.l_today, self.l_block, self.bar, self.sess, self.limits, self.root,
                   *[w for row in self.limit_rows for w in row]):
             self._bind(w)
+        for w in (self.l_ctx, self.l_today, *[w for row in self.limit_rows for w in row]):
+            self._hoverable(w)
+        for row in self.limit_rows:  # 막대 줄은 이름·막대·값 어디에 올려도 같은 툴팁
+            for w in row:
+                w.tip_anchor = row[0]
         self.last = None
         self.bar.bind("<Configure>", lambda e: self.last and self._render(self.last))
         self._layout()
@@ -329,20 +409,35 @@ class Widget:
         w.bind("<Double-Button-1>", lambda e: self._toggle("compact"))
         w.bind("<Button-3>", self._menu)
 
+    def _hoverable(self, w):
+        w.bind("<Enter>", lambda e: self._show_tip(w))
+        w.bind("<Leave>", lambda e: self._hide_tip())
+
     def _show_tip(self, w):
         self._hide_tip()
         if not getattr(w, "tip_text", ""):
             return
-        self.tip = tk.Toplevel(self.root)
+        self.tip, self.tip_owner = tk.Toplevel(self.root), w
         self.tip.overrideredirect(True)
         self.tip.attributes("-topmost", True)
-        tk.Label(self.tip, text=w.tip_text, font=("Segoe UI", 9), justify="left",
-                 bg="#2c2f37", fg=COLORS["fg"], padx=6, pady=3).pack()
+        self.tip_label = tk.Label(self.tip, text=w.tip_text, font=("Segoe UI", 9), justify="left",
+                                  bg="#2c2f37", fg=COLORS["fg"], padx=6, pady=3)
+        self.tip_label.pack()
+        self._place_tip()
+
+    def _place_tip(self):
         self.tip.update_idletasks()  # 아래 줄을 가리지 않게 위젯 왼쪽 바깥, 같은 높이에 띄운다
         x = self.root.winfo_rootx() - self.tip.winfo_width() - 4
         if x < 0:
             x = self.root.winfo_rootx() + self.root.winfo_width() + 4
-        self.tip.geometry(f"+{x}+{w.winfo_rooty()}")
+        anchor = getattr(self.tip_owner, "tip_anchor", self.tip_owner)
+        self.tip.geometry(f"+{x}+{anchor.winfo_rooty()}")
+
+    def _refresh_tip(self):
+        # 띄워 둔 동안에도 "n분 전" 같은 값이 갱신되게 한다
+        if self.tip and self.tip_owner.winfo_exists() and getattr(self.tip_owner, "tip_text", ""):
+            self.tip_label.config(text=self.tip_owner.tip_text)
+            self._place_tip()
 
     def _hide_tip(self):
         if self.tip:
@@ -430,6 +525,57 @@ class Widget:
         if not plan:
             self.l_block.config(fg=COLORS["dim"])
         self._render_sessions(s["sessions"] if s["active"] > 1 else [])
+        self._render_tips(s, plan)
+        self._refresh_tip()
+
+    def _dur(self, td):
+        m = max(0, int(td.total_seconds() // 60))
+        if m >= 1440:
+            return self.t("d").format(m // 1440, m % 1440 // 60)
+        if m >= 60:
+            return self.t("h").format(m // 60, m % 60)
+        return self.t("m").format(m)
+
+    def _ago(self, seconds):
+        return self.t("now") if seconds < 60 else self.t("ago").format(self._dur(timedelta(seconds=seconds)))
+
+    def _render_tips(self, s, plan):
+        now = datetime.now().astimezone()
+        cur = s["cur"]
+        self.l_ctx.tip_text = "\n".join([
+            cur["name"],
+            self.t("t_cost").format(cur["cost"]),
+            self.t("t_resp").format(cur["replies"], cur["tools"], self.cfg["tool_budget"]),
+            self.t("t_last").format(self._ago((now - cur["last"]).total_seconds()), cur["model"]),
+        ]) if cur and cur["last"] else ""
+
+        lines = [f"{m}  ${c:.2f}" for m, c in sorted(s["models"].items(), key=lambda x: -x[1]) if c >= 0.005]
+        if s["today_cost"] > 0:
+            lines.append(self.t("t_sub").format(s["sub_cost"] / s["today_cost"] * 100, s["sub_cost"]))
+        self.l_today.tip_text = "\n".join(lines)
+
+        if not plan:
+            return
+        five_tip, week_tip = [], []
+        if plan["reset"]:
+            five_tip.append(self.t("t_reset").format(self._dur(plan["reset"] - now), f"{plan['reset']:%H:%M}"))
+        five_tip.append(self.t("t_fetched").format(self._ago(time.time() - plan["at"])))
+        eta, at_reset = self.plan.forecast(plan)
+        five_tip.append(self.t("t_eta").format(
+            f"{eta:%H:%M}" if eta else self.t("t_safe").format(at_reset) if at_reset is not None else self.t("t_flat")))
+        if plan["week_reset"]:
+            left = plan["week_reset"] - now
+            week_tip.append(self.t("t_reset").format(self._dur(left), f"{plan['week_reset']:%m/%d %H:%M}"))
+            frac = 1 - left / timedelta(days=7)  # 주간 창에서 지난 비율
+            if plan["week"] is not None and frac > 0:
+                pct, expect = plan["week"], frac * 100
+                week_tip.append(self.t("t_pace").format(
+                    self.t("t_ahead") if pct <= expect else self.t("t_over"), abs(expect - pct), expect))
+                if frac >= 0.05:  # 창 초반엔 외삽이 크게 튄다
+                    week_tip.append(self.t("t_proj").format(pct / frac))
+        for (name, meter, value), tip in zip(self.limit_rows, (five_tip, week_tip)):
+            for w in (name, meter, value):
+                w.tip_text = "\n".join(tip)
 
     def _ctx_color(self, ctx, base):
         return (COLORS["stop"] if ctx >= self.cfg["stop_ctx"]
