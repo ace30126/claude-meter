@@ -1,0 +1,6 @@
+build/
+dist/
+__pycache__/
+*.spec
+claude_meter.json
+claude_meter_usage.json
