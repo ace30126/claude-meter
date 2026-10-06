@@ -7,7 +7,7 @@
   1. 현재 세션 컨텍스트 (마지막 메인 응답의 input + cache_creation + cache_read)
   2. 오늘 누적 토큰 · API 단가 환산 비용
   3. 플랜 한도 사용률(5시간·주간). 실패하면 로그로 추정한 5시간 블록 토큰 · 남은 시간
-  4. 활성 세션이 2개 이상이면 세션#1, 세션#2, 기타 N개 (마우스를 올리면 작업 폴더 이름)
+  4. 활성 세션이 2개 이상이면 세션#1, 세션#2, 기타 N개 (마우스를 올리면 세션 제목, 없으면 작업 폴더 이름)
   줄마다 마우스를 올리면 툴팁: 세션 비용·응답·툴 호출 / 모델별 $·서브에이전트 비중 / 5h 소진 예측 / 주간 페이스
 
 한도 사용률은 Claude Code 로그인 토큰(~/.claude/.credentials.json)으로 /usage 와 같은 비공개 엔드포인트를
@@ -120,6 +120,7 @@ class Ledger:
         self.ctx = {}       # main session path -> (ts, context tokens)
         self.cwd = {}       # main session path -> 작업 폴더
         self.start = {}     # main session path -> 첫 응답 시각
+        self.title = {}     # main session path -> Claude Code 가 붙인 세션 제목(ai-title)
         self.events = {}    # message id -> (datetime, model, usage, is_sub)
         self.msgs = {}      # main session path -> {message id: (model, usage, is_sub)}  서브에이전트 포함
         self.tools = {}     # main session path -> 툴 호출(tool_use id) 집합
@@ -149,6 +150,12 @@ class Ledger:
             data = f.read()
         end = data.rfind(b"\n") + 1  # 쓰는 중인 마지막 줄은 다음 번에 읽는다
         for raw in data[:end].splitlines():
+            if b'"ai-title"' in raw and not is_sub:  # 제목은 대화가 진행되며 바뀔 수 있어 마지막 값을 쓴다
+                try:
+                    self.title[path] = json.loads(raw).get("aiTitle") or self.title.get(path)
+                except ValueError:
+                    pass
+                continue
             if b'"usage"' not in raw:
                 continue
             try:
@@ -206,7 +213,7 @@ class Ledger:
         else:
             block_left = block_start + BLOCK - now
 
-        live = sorted(((ts, c, f"{session_name(self.cwd.get(p))}  ({self.start[p].astimezone():%H:%M}~)") for p, (ts, c) in self.ctx.items()
+        live = sorted(((ts, c, self._name(p)) for p, (ts, c) in self.ctx.items()
                        if now - ts < timedelta(minutes=10)), reverse=True)
         latest = max(self.ctx, key=lambda p: self.ctx[p][0], default=None)
         return {"ctx": self.ctx[latest][1] if latest else None, "active": len(live), "sessions": live,
@@ -214,10 +221,15 @@ class Ledger:
                 "today_tok": today_tok, "today_cost": today_cost, "models": models, "sub_cost": sub_cost,
                 "block_tok": block_tok, "block_left": block_left}
 
+    def _name(self, path):
+        # 대부분 홈 폴더에서 시작해 폴더 이름(~)만으로는 구분이 안 되므로 세션 제목을 먼저 쓴다
+        name = self.title.get(path) or session_name(self.cwd.get(path))
+        return f"{name}  ({self.start[path].astimezone():%H:%M}~)"
+
     def _session(self, path, overrides):
         msgs = self.msgs.get(path, {}).values()
         last_ts, model = self.last.get(path, (None, ""))
-        return {"name": f"{session_name(self.cwd.get(path))}  ({self.start[path].astimezone():%H:%M}~)",
+        return {"name": self._name(path),
                 "cost": sum(cost_of(m, u, overrides) for m, u, _ in msgs),
                 "replies": sum(1 for *_, side in msgs if not side),
                 "tools": len(self.tools.get(path, ())), "last": last_ts, "model": short_model(model)}
